@@ -1,0 +1,26 @@
+{
+  "source":"mtgtop8",
+  "format_id":"duel_commander",
+  "source_deck_id":1001,
+  "deck_name":"Synthetic fixture: commander A",
+  "player_name":"Test Player",
+  "parser_version":"fixture-v1",
+  "placement_text":"3-4",
+  "rank_min":3,
+  "rank_max":4,
+  "result_kind":"tournament_finish",
+  "event":{
+    "source_event_id":9001,
+    "title":"Synthetic test event",
+    "event_date":"2026-11-18",
+    "player_count":32,
+    "platform":"paper",
+    "event_kind":"tournament",
+    "coverage":"top_finishes"
+  },
+  "cards":[
+    {"oracle_id":"00000000-0000-4000-8000-000000000001","zone":"commander","quantity":1},
+    {"oracle_id":"00000000-0000-4000-8000-000000000003","zone":"main","quantity":98},
+    {"oracle_id":"00000000-0000-4000-8000-000000000004","zone":"main","quantity":1}
+  ]
+}
