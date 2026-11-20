@@ -11,6 +11,11 @@ Project: `djayrdiyastspmoaqkml`. Source scope: **MTGTop8 Duel Commander only**.
 There are no separate event, revision, queue, or logging tables. A corrected deck updates its
 existing row. The current list is retained; historical revisions are not stored.
 
+**Deployment:** installed in this Supabase project on November 19, 2026, through its authenticated
+MCP connection. Supabase migration: `20261120030316_create_duel_commander_decks_and_cards`.
+Verified both tables, insert/update/query function permissions, and a live Python REST usage query.
+The deployment created the schema only; card and deck imports are the next step.
+
 ## Create the tables once
 
 Run [supabase/bootstrap.sql](supabase/bootstrap.sql) in the new project's SQL Editor.
