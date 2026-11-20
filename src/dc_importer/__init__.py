@@ -1,1 +1,1 @@
-"""Duel Commander database foundation; crawler implementation follows separately."""
+"""Two-table Duel Commander storage and Supabase RPC clients."""

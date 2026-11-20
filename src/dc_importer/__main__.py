@@ -5,7 +5,8 @@ from pathlib import Path
 
 import psycopg
 
-from .db import build_sql, check_identity, connect, migrate
+from .client import data_client, rpc
+from .db import build_sql, connect, migrate
 from .models import catalog_card, validate_deck
 from .repository import load_cards, load_decks, records, resolve_name
 
@@ -13,8 +14,8 @@ from .repository import load_cards, load_decks, records, resolve_name
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Duel Commander database setup and data writes")
     sub = root.add_subparsers(dest="command", required=True)
-    sub.add_parser("migrate", help="Apply pending migrations to the dedicated project")
-    sql = sub.add_parser("build-sql", help="Build a one-time SQL Editor bootstrap")
+    sub.add_parser("migrate", help="Create/update the dedicated two-table schema")
+    sql = sub.add_parser("build-sql", help="Build the re-runnable SQL Editor setup")
     sql.add_argument("--output", type=Path, default=Path("supabase/bootstrap.sql"))
     for command in ("load-cards", "load-decks"):
         cmd = sub.add_parser(command)
@@ -59,49 +60,57 @@ def run(args: argparse.Namespace) -> dict:
         validate = catalog_card if args.command == "load-cards" else validate_deck
         count = sum(1 for payload in records(args.file) if validate(payload))
         return {"validated_records": count, "dry_run": True, "database_checked": False}
-    with connect() as conn:
-        if args.command == "migrate":
+    if args.command == "migrate":
+        with connect() as conn:
             return {"applied": migrate(conn)}
-        check_identity(conn)
+    with data_client() as client:
         if args.command == "load-cards":
-            return load_cards(conn, args.file)
+            return load_cards(client, args.file)
         if args.command == "load-decks":
-            return load_decks(conn, list(records(args.file)))
+            return load_decks(client, list(records(args.file)))
         if args.command == "resolve-name":
-            return resolve_name(conn, args.name)
+            return resolve_name(client, args.name)
         if args.command == "add-alias":
-            conn.execute(
-                "select ingestion.add_reviewed_alias(%s,%s::uuid,%s)",
-                (args.alias, args.oracle_id, args.note),
+            rpc(
+                client,
+                "add_reviewed_alias",
+                {
+                    "p_alias": args.alias,
+                    "p_oracle_id": args.oracle_id,
+                    "p_note": args.note,
+                },
             )
             return {"alias_added": args.alias}
         if args.command == "set-state":
-            conn.execute(
-                "select ingestion.set_deck_state(%s,%s,%s)",
-                (args.source_deck_id, args.state, args.reason),
+            rpc(
+                client,
+                "set_deck_state",
+                {
+                    "p_source_deck_id": args.source_deck_id,
+                    "p_state": args.state,
+                    "p_reason": args.reason,
+                },
             )
             return {"source_deck_id": args.source_deck_id, "state": args.state}
-        common = (
-            args.commanders,
-            args.match,
-            args.date_from,
-            args.date_to,
-            args.platform,
-            args.event_kind,
-            args.min_players,
-            args.max_rank,
-        )
+        arguments = {
+            "p_commander_ids": args.commanders,
+            "p_match_mode": args.match,
+            "p_date_from": args.date_from,
+            "p_date_to": args.date_to,
+            "p_platform": args.platform,
+            "p_event_kind": args.event_kind,
+            "p_min_players": args.min_players,
+            "p_max_rank": args.max_rank,
+            "p_limit": args.limit,
+            "p_offset": args.offset,
+        }
         if args.command == "usage":
-            return conn.execute(
-                """select public.get_commander_card_usage(
-                %s::uuid[],%s,%s::date,%s::date,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (*common, not args.exclude_lands, args.include_basics, args.limit, args.offset),
-            ).fetchone()[0]
-        return conn.execute(
-            """select public.get_commander_decks(
-            %s::uuid[],%s,%s::date,%s::date,%s,%s,%s,%s,%s::uuid,%s,%s)""",
-            (*common, args.card_id, args.limit, args.offset),
-        ).fetchone()[0]
+            arguments.update(
+                p_include_lands=not args.exclude_lands, p_include_basics=args.include_basics
+            )
+            return rpc(client, "get_commander_card_usage", arguments)
+        arguments["p_card_id"] = args.card_id
+        return rpc(client, "get_commander_decks", arguments)
 
 
 def main() -> int:

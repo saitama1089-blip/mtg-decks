@@ -1,73 +1,61 @@
 # Duel Commander data
 
-Database foundation for MTGTop8 **Duel Commander only**. Target Supabase project:
-`djayrdiyastspmoaqkml` (`https://djayrdiyastspmoaqkml.supabase.co`).
+Two ordinary Supabase tables, following the existing PauperBrews deck-storage pattern:
 
-This repository includes SQL migrations, transactional insert/update functions, a Python CLI,
-commander card-usage queries, and database tests. Crawling MTGTop8 and scheduling hourly imports
-are the next stage. No scraper runs from this version.
+| Table | One row per | Stored data |
+| --- | --- | --- |
+| `mtg_decks` | MTGTop8 deck ID | Player, commander(s), event details, JSON decklist, timestamps |
+| `cards` | Scryfall Oracle ID | Card names, faces, types, images, legality, reviewed aliases |
 
-## Create the tables
+Project: `djayrdiyastspmoaqkml`. Source scope: **MTGTop8 Duel Commander only**.
+There are no separate event, revision, queue, or logging tables. A corrected deck updates its
+existing row. The current list is retained; historical revisions are not stored.
 
-Choose one method for the new project.
+## Create the tables once
 
-**SQL Editor:** paste [supabase/bootstrap.sql](supabase/bootstrap.sql) into the new project's
-SQL Editor and run it once. It creates the complete schema in a transaction and records the
-migration checksums. Future updates can use the Python migration runner.
+Run [supabase/bootstrap.sql](supabase/bootstrap.sql) in the new project's SQL Editor.
+The script creates the two tables, indexes, timestamp/validation trigger, and RPC functions in
+one transaction. It is safe to rerun for this schema and refuses a table from another schema.
+It never drops existing user data. The previous eight-table draft was not deployed to this project.
 
-**Python:** install from this checkout, copy `.env.example` to `.env`, and replace the placeholder
-with the new project's PostgreSQL direct or session-pooler connection from Dashboard > Connect.
-The HTTPS project URL is not a PostgreSQL connection string. Keep `.env` private.
+Alternatively, configure the project's PostgreSQL connection as `SUPABASE_DB_URL` in `.env` and run:
+
+```bash
+python -m dc_importer migrate
+```
+
+A Supabase REST secret is sufficient for normal inserts, updates, and queries **after** this SQL
+has been applied. Creating tables requires the SQL Editor or a PostgreSQL connection.
+
+## Python setup
 
 ```powershell
 py -3.14 -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -r requirements.lock.txt
 python -m pip install --no-deps -e .
-Copy-Item .env.example .env
-# Set SUPABASE_DB_URL in .env, then:
-python -m dc_importer migrate
+# Copy .env.example to .env only if you do not already have a configured .env.
 ```
 
-The runner applies each migration once and rejects edited migration files. Its connection check
-requires the dedicated project reference and TLS; subsequent writes also verify the database's
-deployment marker. No database password is included in this repository.
+Set `SUPABASE_URL` and `SUPABASE_SECRET_KEY` in the ignored `.env`, or in GitHub Actions
+variables/secrets. The worker checks that its endpoint belongs to this dedicated project.
+It sends opaque secret keys in the `apikey` header. Credentials are never committed or printed.
 
-Alternatively, store the same admin connection string as the GitHub repository secret
-`SUPABASE_MIGRATION_DB_URL` and manually run **Apply database migrations** under Actions.
-That workflow has no schedule. It uses admin credentials only for migrations.
+## Inserts and updates
 
-## Tables and permissions
+The normal write pattern is one RPC call with a payload:
 
-| Schema | Tables |
-| --- | --- |
-| `public` | `cards`, `card_names`, `events`, `mtg_decks`, `deck_versions`, `deck_cards`, `commander_groups`, `commander_group_members` |
-| `ingestion` (private) | `deployment`, `schema_migrations`, `import_runs`, `source_fetches`, `crawl_tasks`, `source_state`, `unresolved_card_names` |
+```python
+supabase.rpc("upsert_mtg_deck", {"p_deck": payload}).execute()
+supabase.rpc("upsert_cards", {"p_cards": card_batch}).execute()
+```
 
-`mtg_decks` preserves the useful PauperBrews fields, including the `{section, qty, name}` JSON
-projection. Normalized cards and immutable revisions power statistics. Only one accepted current
-revision per source deck contributes. Identical lists from different players/events remain
-distinct observations. The format is enforced in the database.
+`upsert_mtg_deck` uses `INSERT ... ON CONFLICT (source_deck_id) DO UPDATE` and returns
+`inserted`, `updated`, or `unchanged`. It keeps the same deck row/UUID when the list changes.
+`upsert_mtg_decks` accepts an atomic batch of 1-100 decks. An invalid deck rolls back that batch.
+`upsert_cards` inserts or updates up to 2,000 card records by `oracle_id`.
 
-Public tables have RLS enabled. Anonymous and ordinary authenticated API clients have no access
-by default. `dc_reader` can execute bounded usage/source-list queries. `dc_importer` can execute
-validated write functions, read the catalog, and manage ingestion records. Both are NOLOGIN group
-roles. The Supabase `service_role`, when present, inherits these groups. A direct worker login can
-be granted `dc_importer` by the database administrator; group-role creation does not create a login
-or password. Keep database-owner credentials for migrations and use an importer login for jobs.
-
-The CLI currently uses a PostgreSQL connection, not the Supabase REST key. Read API functions are
-closed to `anon` until a deliberate application access decision is made. Functions use explicit
-search paths. Raw source capture storage is represented by private paths; bucket provisioning and
-the storage uploader are part of the later crawler stage.
-
-## Insert and update data
-
-Load the Oracle card catalog **before** decks. The card loader accepts a Scryfall Oracle JSON
-array, normalized JSON objects, `.jsonl`, or `.jsonl.gz` files and streams large arrays. Get the
-current download URL from [Scryfall bulk metadata](https://api.scryfall.com/bulk-data/oracle_cards).
-It does not filter to Arena cards. Each batch is atomic; a failed large catalog load reports how
-many earlier batches committed and is safe to repeat.
+Load the card catalog first, then decks:
 
 ```bash
 python -m dc_importer load-cards data/oracle-cards.jsonl.gz --dry-run
@@ -76,60 +64,66 @@ python -m dc_importer load-decks data/decks.json --dry-run
 python -m dc_importer load-decks data/decks.json
 ```
 
-Deck input is one object or an array. See [the input fixture](tests/fixtures/deck.json) for the
-contract. Fixtures contain **synthetic IDs** and are for tests only. Production rows need actual
-Scryfall Oracle UUIDs, explicit source/format, an event, source deck ID, parser version, and card
-rows with `oracle_id`, `zone`, and `quantity`. Main plus commander must total 100; companions and
-other outside-deck zones are retained separately. This validates import completeness, not full
-historical rules legality.
+Card input accepts Scryfall Oracle JSON arrays, JSONL, or gzip JSONL and streams large files.
+Catalog batches commit separately; repeating a partially completed catalog load is safe.
+The [Scryfall metadata endpoint](https://api.scryfall.com/bulk-data/oracle_cards) provides its
+current download location. All relevant Oracle cards are included, without an Arena-only filter.
 
-A repeated source deck/list keeps its revision. Different list content creates a new immutable
-revision and updates the current pointer atomically. Reverting A -> B -> A preserves three
-revisions. Repeated fetches do not change the content-update timestamp. A deck batch is limited
-to 1,000 decks and rolls back fully if any deck fails. Each committed batch gets an import log.
-Dry runs validate the file without connecting or writing; they do not verify catalog foreign keys.
+See [tests/fixtures/deck.json](tests/fixtures/deck.json) for the deck payload's source/event fields.
+Its IDs are synthetic test data. The `cards` array can use the PauperBrews shape:
 
-Resolve names exactly against canonical names/face aliases, or add a reviewed spelling:
+```json
+[
+  {"section":"Commander", "qty":1, "name":"Ertai Resurrected"},
+  {"section":"Deck", "qty":1, "name":"Counterspell"}
+]
+```
+
+That fragment illustrates the format; a complete main list plus commander must total 100.
+Names are resolved exactly against the card catalog and its face names/reviewed aliases.
+For resolved source data, each entry can instead contain `oracle_id`, `zone`, and `quantity`.
+The database stores canonical `{section, qty, name, oracle_id}` entries and combines repeated
+lines. It derives commander IDs, commander display text, total cards, the source URL, and a
+list hash. Commander pairs are order independent. Companion/sideboard/maybeboard rows remain
+separate from the main 100-card count.
+
+On a repeat import, `last_seen_at` advances. `last_updated` advances only for a meaningful list
+or metadata change. Invalid quantities, ambiguous names, unknown Oracle IDs, other formats,
+and incomplete decks are rejected. This validates import completeness, not historical legality.
+Dry runs validate file structure without checking catalog foreign keys or writing anything.
 
 ```bash
 python -m dc_importer resolve-name "Ertai Resurrected"
-python -m dc_importer add-alias "Source spelling" ACTUAL_ORACLE_UUID --note "Reviewed against source"
-python -m dc_importer set-state 913883 quarantined --reason "Source list is incomplete"
+python -m dc_importer add-alias "Source spelling" ORACLE_UUID --note "Reviewed against source"
+python -m dc_importer set-state 913883 quarantined --reason "Source list incomplete"
 ```
 
-Ambiguous aliases return all candidates. They never choose a fuzzy match. Quarantined/removed
-decks retain history and are excluded from usage queries. A validated import restores readiness.
-Do not mark a deck removed because a single fetch failed.
+Reviewed aliases live inside the card row and survive catalog updates. Quarantined/removed
+rows retain their data and are excluded from usage queries. A valid upsert restores readiness.
 
-The underlying SQL entry points are `ingestion.upsert_cards(jsonb)`,
-`ingestion.import_deck(jsonb)`, `ingestion.add_reviewed_alias(text,uuid,text)`, and
-`ingestion.set_deck_state(bigint,text,text)`. The Python CLI binds parameters; raw SQL strings are
-not interpolated from deck data.
-
-## Fetch cards used by a commander
+## Most-used cards by commander
 
 ```bash
-python -m dc_importer usage COMMANDER_ORACLE_UUID --from 2026-08-22 --to 2026-11-20
+python -m dc_importer usage COMMANDER_UUID --from 2026-08-22 --to 2026-11-20
 python -m dc_importer usage FIRST_UUID SECOND_UUID --from 2026-08-22 --to 2026-11-20
-python -m dc_importer decks COMMANDER_ORACLE_UUID --from 2026-08-22 --to 2026-11-20 --card-id CARD_UUID
+python -m dc_importer decks COMMANDER_UUID --from 2026-08-22 --to 2026-11-20 --card-id CARD_UUID
 ```
 
-Dates refer to the event; `--to` is exclusive. Exact matching separates a single commander from
-partner pairs, and pair order does not matter. `--match contains` includes every pairing with one
-selected commander. Filters include platform, event kind, minimum entrants, and maximum tournament
-rank. Unknown source values cannot satisfy an active filter. League display order is not treated
-as a tournament rank.
+`get_commander_card_usage` expands the JSON decklists in SQL and joins the card catalog.
+It counts one inclusion per main deck, returns the sample size and date interval, and supports
+exact pairs or `contains` mode for a selected commander. Land filters change displayed cards,
+not the denominator. `get_commander_decks` supplies supporting lists. Both cap pages at 200.
 
-`public.get_commander_card_usage` returns the sample size, events, observed interval, filter
-definition, and ranked cards. Inclusion is **decks containing the card / eligible decks**, counting
-one inclusion per main deck. Lands/basic-land filtering changes the displayed cards, never the
-denominator. Commanders and outside-deck zones are excluded from the numerator. Basic lands are
-hidden by default; use `--include-basics` to show them. `public.get_commander_decks` supplies paged
-supporting lists. Both queries cap page size at 200 and order results deterministically.
+Dates refer to the event; the upper date is exclusive. Platform, event kind, minimum entrants,
+and tournament-finish filters are available. Unknown source values do not satisfy an active
+filter. League display order is not a tournament rank. These are published-list inclusion
+percentages, not card win rates or complete tournament-field shares.
 
-These are published-list usage counts, not win rates or complete tournament-field shares.
+## Permissions and verification
 
-## Verification and development
+RLS is enabled on both tables. Anonymous/authenticated public clients cannot write or call the
+RPCs. Writes and queries run through the server-side `service_role` credential. No extra
+application login roles are created. SQL functions use the caller's privileges.
 
 ```bash
 ruff check .
@@ -138,16 +132,10 @@ pytest -q
 python -m dc_importer build-sql
 ```
 
-Without `TEST_DATABASE_URL`, local pytest runs the offline tests and skips the database scenario.
-To run database integration checks locally, set it to an **empty, disposable PostgreSQL database**.
-The tests never drop existing tables and refuse a nonempty target. GitHub CI supplies PostgreSQL
-16 and runs the migration, import, revision, rollback, partner, usage, RLS/role, and immutability
-checks. Test data is not loaded into Supabase automatically.
+GitHub CI supplies a disposable PostgreSQL 16 instance. It checks that exactly two tables exist,
+repeat imports, updates, batch rollback, name resolution, partner matching, usage percentages,
+and public access restrictions. Local pytest skips integration tests unless `TEST_DATABASE_URL`
+points to an empty disposable database. Tests never load fixture rows into Supabase automatically.
 
-Edit migrations only before deployment. After deployment, add a new migration and regenerate
-`bootstrap.sql` with `python -m dc_importer build-sql`; the runner detects checksum drift. The
-bootstrap is a fresh-project convenience, not an update script to rerun on existing tables.
-
-References: [Supabase database connections](https://supabase.com/docs/guides/database/connecting-to-postgres),
-[Supabase RLS](https://supabase.com/docs/guides/database/postgres/row-level-security),
-[Psycopg transactions](https://www.psycopg.org/psycopg3/docs/basic/transactions.html).
+`Apply database migrations` is a manual workflow using `SUPABASE_MIGRATION_DB_URL`.
+There is no scheduled scraper yet. The Python scraper and hourly/daily schedule are the next stage.

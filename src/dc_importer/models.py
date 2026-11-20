@@ -41,14 +41,35 @@ def validate_deck(payload: dict) -> dict:
     if not isinstance(cards, list) or not 1 <= len(cards) <= 500:
         raise ValueError("cards must contain 1 to 500 rows")
     totals: dict[tuple[str, str], int] = defaultdict(int)
+    identities = {}
+    sections = {
+        "commander": "commander",
+        "deck": "main",
+        "main": "main",
+        "companion": "companion",
+        "sideboard": "sideboard",
+        "maybeboard": "maybeboard",
+    }
     for card in cards:
-        if not isinstance(card, dict) or card.get("zone") not in ZONES:
+        if not isinstance(card, dict):
+            raise ValueError("Each card must be an object")
+        zone = card.get("zone") or sections.get(str(card.get("section", "")).lower())
+        if zone not in ZONES:
             raise ValueError("Each card needs a known zone")
-        try:
-            identity = str(UUID(card["oracle_id"]))
-        except (KeyError, ValueError, TypeError, AttributeError) as exc:
-            raise ValueError("Each card needs a valid oracle_id UUID") from exc
-        totals[(card["zone"], identity)] += positive_integer(card.get("quantity"), "quantity")
+        if card.get("oracle_id") is not None:
+            try:
+                identity = str(UUID(card["oracle_id"]))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ValueError("Each card needs a valid oracle_id UUID") from exc
+            identities[identity] = {"oracle_id": identity}
+        elif isinstance(card.get("name"), str) and card["name"].strip():
+            identity = "name:" + name_key(card["name"])
+            identities[identity] = {"name": card["name"]}
+        else:
+            raise ValueError("Each card needs an Oracle UUID or a card name")
+        totals[(zone, identity)] += positive_integer(
+            card.get("quantity", card.get("qty")), "quantity"
+        )
     commanders = {identity: qty for (zone, identity), qty in totals.items() if zone == "commander"}
     if not 1 <= len(commanders) <= 2 or any(qty != 1 for qty in commanders.values()):
         raise ValueError("Need one or two distinct commanders, one copy each")
@@ -59,7 +80,7 @@ def validate_deck(payload: dict) -> dict:
         raise ValueError(f"Expected 100 main plus commander cards; got {count}")
     result.setdefault("source_cards", copy.deepcopy(cards))
     result["cards"] = [
-        {"zone": zone, "oracle_id": identity, "quantity": qty}
+        {"zone": zone, **identities[identity], "quantity": qty}
         for (zone, identity), qty in sorted(totals.items())
     ]
     return result
