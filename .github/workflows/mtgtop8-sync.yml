@@ -13,6 +13,13 @@ on:
       since:
         description: Optional historical start date (YYYY-MM-DD); repeat to resume backfill
         type: string
+      until:
+        description: Optional exclusive end date (YYYY-MM-DD), e.g. 2026-11-01 for October
+        type: string
+      full_window:
+        description: Import the full date window (up to 10000 decks and 90 minutes)
+        default: false
+        type: boolean
       max_decks:
         description: Maximum decks per batch
         default: '50'
@@ -39,7 +46,7 @@ concurrency:
 jobs:
   import:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: ${{ inputs.full_window && 105 || 25 }}
     env:
       CACHE_MODE: ${{ inputs.dry_run && 'preview' || 'live' }}
     steps:
@@ -65,6 +72,8 @@ jobs:
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           LOOKBACK_DAYS: ${{ inputs.lookback_days || '14' }}
           SINCE: ${{ inputs.since }}
+          UNTIL: ${{ inputs.until }}
+          FULL_WINDOW: ${{ inputs.full_window }}
           MAX_DECKS: ${{ inputs.max_decks || '50' }}
           EVENT_ID: ${{ inputs.event_id }}
           DRY_RUN: ${{ inputs.dry_run }}
@@ -77,7 +86,12 @@ jobs:
           fi
           args=(--lookback-days "$LOOKBACK_DAYS" --max-decks "$MAX_DECKS"
                 --max-events 20 --max-pages 5 --max-requests 150 --max-runtime-minutes 15)
+          if [[ "$FULL_WINDOW" == 'true' ]]; then
+            args+=(--max-decks 10000 --max-events 10000 --max-pages 500
+                   --max-requests 10000 --max-runtime-minutes 90)
+          fi
           [[ -z "$SINCE" ]] || args+=(--since "$SINCE")
+          [[ -z "$UNTIL" ]] || args+=(--until "$UNTIL")
           [[ -z "$EVENT_ID" ]] || args+=(--event-id "$EVENT_ID")
           [[ "$DRY_RUN" != 'true' ]] || args+=(--dry-run)
           [[ "$FORCE" != 'true' ]] || args+=(--force)

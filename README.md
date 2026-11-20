@@ -75,6 +75,9 @@ python -m dc_importer scrape --event-id 94041 --force
 
 # Historical import: repeat the same command to work through bounded batches.
 python -m dc_importer scrape --since 2026-08-22
+
+# A complete calendar month, excluding November 1 and later.
+python -m dc_importer scrape --since 2026-10-01 --until 2026-11-01
 ```
 
 Manual workflow inputs expose the date window, historical start, deck batch size, event ID,
@@ -82,6 +85,18 @@ preview mode, and forced refresh. A historical run follows the site's **All Comm
 link and its pagination. Historical work outside the normal 14-day window must be resumed
 with the same `--since` value (or manual workflow input). Initial runs are bounded batches,
 not a claim that every deck in the requested period has already been imported.
+
+For a one-off complete-month trial, set workflow inputs `since=2026-10-01`,
+`until=2026-11-01`, and `full_window=true`. This mode replaces the ordinary batch limits
+with caps of 10,000 decks/events, 500 listing pages, 10,000 upstream requests, and 90 minutes.
+It retains robots/rate-limit checks and saves the same checkpoint. These are execution caps,
+not a claim about how much data exists; rerun the same window if a cap leaves work pending.
+Ordinary hourly runs retain their 50-deck/15-minute limits.
+
+The report includes elapsed seconds, decks per minute, and window-wide counts of discovered,
+processed, pending, and failed events/decks. Pending counts include records waiting for a retry.
+`coverage_complete` is true only after listing discovery and every discovered record in the
+window succeed. Live progress appears in the Action logs while it runs.
 
 The worker reads server-rendered HTML, honors the source's robots directives, and spaces
 MTGTop8 requests at least five seconds apart. One run allows at most five listing pages,

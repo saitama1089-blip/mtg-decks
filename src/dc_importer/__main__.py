@@ -22,6 +22,7 @@ def parser() -> argparse.ArgumentParser:
     scrape.add_argument("--report", type=Path, default=Path("data/run-report.json"))
     scrape.add_argument("--lookback-days", type=int, default=14)
     scrape.add_argument("--since", help="Historical discovery start date, YYYY-MM-DD")
+    scrape.add_argument("--until", help="Exclusive end date, YYYY-MM-DD")
     scrape.add_argument("--max-pages", type=int, default=5)
     scrape.add_argument("--max-events", type=int, default=20)
     scrape.add_argument("--max-decks", type=int, default=50)

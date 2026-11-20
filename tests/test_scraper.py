@@ -14,7 +14,7 @@ from dc_importer.catalog import CardResolver
 from dc_importer.http import BudgetReached, Page
 from dc_importer.models import validate_deck
 from dc_importer.mtgtop8 import INDEX, PARSER_VERSION
-from dc_importer.scraper import discover, due, load_state, scrape
+from dc_importer.scraper import coverage, discover, due, load_state, queue_events, scrape
 
 SAMPLE = (Path(__file__).parent / "fixtures/mtgtop8/single.html").read_text(encoding="utf-8")
 
@@ -245,3 +245,111 @@ def test_runtime_failure_report_is_not_a_success(runner, monkeypatch):
     report = json.loads((tmp_path / "report.json").read_text())
     assert report["status"] == "error"
     assert report["stop_reason"] == "Unexpected RuntimeError"
+
+
+def test_calendar_month_includes_october_boundaries_only(tmp_path):
+    state = load_state(tmp_path / "state.json")
+    queue_events(
+        state,
+        [
+            {"source_event_id": i, "event_date": when}
+            for i, when in [
+                (1, "2026-09-30"),
+                (2, "2026-10-01"),
+                (3, "2026-10-31"),
+                (4, "2026-11-01"),
+            ]
+        ],
+        date(2026, 10, 1),
+        date(2026, 11, 1),
+    )
+    assert set(state["events"]) == {"2", "3"}
+    state["decks"] = {
+        "1": {
+            "event_id": 2,
+            "event_date": "2026-10-01",
+            "last_error": "Incomplete",
+            "retry_at": 10**20,
+        },
+        "2": {
+            "event_id": 3,
+            "event_date": "2026-10-31",
+            "last_success": 1,
+            "parser_version": PARSER_VERSION,
+        },
+        "3": {"event_id": 4, "event_date": "2026-11-01"},
+    }
+    counts = coverage(state, date(2026, 10, 1), date(2026, 11, 1), set())
+    assert counts["decks"]["discovered"] == 2
+    assert counts["decks"]["processed"] == 1
+    assert counts["decks"]["pending"] == 1  # Backoff cannot hide an unimported deck.
+    assert counts["decks"]["failed"] == 1
+
+
+def test_discovery_skips_newer_month_and_continues_into_requested_month(tmp_path):
+    state = load_state(tmp_path / "state.json")
+    archive = INDEX + "&meta=56"
+    page2, page3 = archive + "&cp=2", archive + "&cp=3"
+    pages = {
+        INDEX: listing([(5, "17/11/26"), (4, "01/11/26")], archive_url=archive),
+        archive: listing([(5, "17/11/26"), (4, "01/11/26")], next_url=page2),
+        page2: listing([(3, "31/10/26"), (2, "01/10/26")], next_url=page3),
+        page3: listing([(1, "30/09/26")]),
+    }
+    http = Mock()
+    http.page.side_effect = lambda url: Page(pages[url], url)
+    result = {"listing_pages": 0}
+    discover(http, state, date(2026, 10, 1), 10, True, result, date(2026, 11, 1))
+    assert result["listing_pages"] == 4
+    assert not result["discovery_truncated"]
+    assert set(state["events"]) == {"2", "3"}
+
+
+def test_complete_month_import_reports_coverage_and_timing(runner, monkeypatch):
+    _, database, tmp_path = runner
+
+    class OctoberHTTP(FakeHTTP):
+        def page(self, url):
+            if "/format" in url:
+                self.count()
+                return Page(
+                    listing(
+                        [(94041, "31/10/26"), (94042, "01/11/26"), (94043, "30/09/26")],
+                        archive_url=INDEX + "&meta=56",
+                    ),
+                    url,
+                )
+            page = super().page(url)
+            return Page(page.text.replace("17/11/26", "31/10/26"), url)
+
+    monkeypatch.setattr("dc_importer.scraper.PoliteHTTP", OctoberHTTP)
+    args = parser().parse_args(
+        [
+            "scrape",
+            "--since",
+            "2026-10-01",
+            "--until",
+            "2026-11-01",
+            "--max-decks",
+            "10",
+            "--state",
+            str(tmp_path / "state.json"),
+            "--report",
+            str(tmp_path / "report.json"),
+        ]
+    )
+    result = scrape(args)
+    assert result["status"] == "success" and result["coverage_complete"]
+    assert result["inserted"] == 4 and result["events_checked"] == 1
+    assert result["coverage"]["decks"]["discovered"] == 4
+    assert result["coverage"]["decks"]["pending"] == 0
+    assert result["window_before"] == "2026-11-01"
+    assert result["elapsed_seconds"] >= 0 and result["decks_per_minute"] > 0
+    assert all(d["event"]["event_date"] == "2026-10-31" for d in database.decks.values())
+
+
+def test_invalid_date_window_does_not_open_a_client(runner):
+    run, database, _ = runner
+    with pytest.raises(ValueError, match="end date"):
+        run("--since", "2026-10-01", "--until", "2026-10-01")
+    assert not database.calls

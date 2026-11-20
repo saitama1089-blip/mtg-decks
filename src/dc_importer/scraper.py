@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import time
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta
@@ -53,22 +54,32 @@ def due(record: dict, refresh_seconds: float, force: bool = False) -> bool:
     )
 
 
-def queue_events(state: dict, events: list[dict], since: date):
+def queue_events(state: dict, events: list[dict], since: date, until: date | None = None):
     for item in events:
-        if date.fromisoformat(item["event_date"]) >= since:
+        when = date.fromisoformat(item["event_date"])
+        if when >= since and (until is None or when < until):
             identity = str(item["source_event_id"])
             state["events"].setdefault(identity, {}).update({"discovered": item})
 
 
-def discover(http, state: dict, since: date, max_pages: int, archive: bool, report: dict):
+def discover(
+    http,
+    state: dict,
+    since: date,
+    max_pages: int,
+    archive: bool,
+    report: dict,
+    until: date | None = None,
+):
     page = http.page(INDEX)
     root = parse_index(page.text, page.url)
-    queue_events(state, root.events, since)
+    queue_events(state, root.events, since, until)
     report["listing_pages"] += 1
     root_ids = [e["source_event_id"] for e in root.events]
     mode = "archive" if archive else "recent"
     cursor = state["discovery"].get(mode, {})
-    if cursor.get("since") != since.isoformat():
+    end = until.isoformat() if until else None
+    if cursor.get("since") != since.isoformat() or cursor.get("until") != end:
         cursor = {}
     if cursor.get("root_ids") == root_ids and cursor.get("completed_at", 0) > time.time() - 86400:
         return
@@ -85,17 +96,19 @@ def discover(http, state: dict, since: date, max_pages: int, archive: bool, repo
         page = http.page(url)
         parsed = parse_index(page.text, page.url)
         report["listing_pages"] += 1
-        queue_events(state, parsed.events, since)
+        queue_events(state, parsed.events, since, until)
         url = parsed.next_url
         if min(date.fromisoformat(e["event_date"]) for e in parsed.events) < since:
             url = None
         state["discovery"][mode] = {
             "since": since.isoformat(),
+            "until": end,
             "next_url": url,
             "root_ids": root_ids,
         }
     state["discovery"][mode] = {
         "since": since.isoformat(),
+        "until": end,
         "next_url": url,
         "root_ids": root_ids,
         "completed_at": time.time() if not url else 0,
@@ -107,6 +120,65 @@ def fail_record(record: dict, error: Exception):
     record["failures"] = record.get("failures", 0) + 1
     record["retry_at"] = time.time() + min(86400, 3600 * 2 ** min(record["failures"] - 1, 5))
     record["last_error"] = str(error)[:500]
+
+
+def scoped_records(state: dict, since: date, until: date, explicit: set[str]):
+    events = {
+        identity: record
+        for identity, record in state["events"].items()
+        if identity in explicit
+        or (
+            not explicit
+            and since.isoformat() <= record["discovered"]["event_date"] < until.isoformat()
+        )
+    }
+    decks = {
+        identity: record
+        for identity, record in state["decks"].items()
+        if str(record["event_id"]) in explicit
+        or (not explicit and since.isoformat() <= record["event_date"] < until.isoformat())
+    }
+    return events, decks
+
+
+def coverage(state: dict, since: date, until: date, explicit: set[str]) -> dict:
+    events, decks = scoped_records(state, since, until, explicit)
+    result = {}
+    for label, records in (("events", events), ("decks", decks)):
+        imported = sum(
+            bool(r.get("last_success")) and r.get("parser_version") == PARSER_VERSION
+            for r in records.values()
+        )
+        failures = [
+            {"id": int(identity), "error": record["last_error"]}
+            for identity, record in records.items()
+            if record.get("last_error")
+        ]
+        result[label] = {
+            "discovered": len(records),
+            "processed": imported,
+            "pending": len(records) - imported,
+            "failed": len(failures),
+            "failures": failures,
+        }
+    return result
+
+
+def log_progress(phase: str, report: dict, state: dict, since: date, until: date, explicit: set):
+    print(
+        json.dumps(
+            {
+                "phase": phase,
+                "at": utc_now(),
+                "inserted": report["inserted"],
+                "updated": report["updated"],
+                "unchanged": report["unchanged"],
+                "coverage": coverage(state, since, until, explicit),
+            }
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def summarize(report: dict):
@@ -129,10 +201,19 @@ def summarize(report: dict):
             "source_requests",
             "remaining_events",
             "remaining_due",
+            "elapsed_seconds",
+            "decks_per_minute",
+            "coverage_complete",
         ):
             stream.write(f"- {field}: {report.get(field)}\n")
         if report["errors"]:
             stream.write("\nErrors are recorded in the run-report artifact.\n")
+        for label, counts in report["coverage"].items():
+            stream.write(
+                f"\n{label}: {counts['discovered']} discovered; "
+                f"{counts['processed']} processed; {counts['pending']} pending; "
+                f"{counts['failed']} failed.\n"
+            )
 
 
 def scrape(args) -> dict:
@@ -151,6 +232,10 @@ def scrape(args) -> dict:
     )
     if since > today:
         raise ValueError("The discovery window starts in the future")
+    until = date.fromisoformat(args.until) if args.until else today + timedelta(days=1)
+    if until <= since:
+        raise ValueError("The exclusive end date must be after the start date")
+    started = time.monotonic()
     state = load_state(args.state)
     http = PoliteHTTP(state["http"], args.max_requests, args.max_runtime_minutes * 60)
     refresh = args.refresh_hours * 3600
@@ -159,6 +244,7 @@ def scrape(args) -> dict:
         "status": "success",
         "dry_run": args.dry_run,
         "window_from": since.isoformat(),
+        "window_before": until.isoformat(),
         "listing_pages": 0,
         "events_checked": 0,
         "deck_attempts": 0,
@@ -201,7 +287,9 @@ def scrape(args) -> dict:
                     args.max_pages,
                     bool(args.since) or args.lookback_days > 14,
                     report,
+                    until,
                 )
+            log_progress("discovery", report, state, since, until, explicit)
             write_json(args.state, state)
             events = sorted(
                 state["events"].items(),
@@ -213,7 +301,9 @@ def scrape(args) -> dict:
             for identity, record in events:
                 if explicit and identity not in explicit:
                     continue
-                if not explicit and record["discovered"]["event_date"] < since.isoformat():
+                if not explicit and not (
+                    since.isoformat() <= record["discovered"]["event_date"] < until.isoformat()
+                ):
                     continue
                 if not due(record, refresh, args.force):
                     continue
@@ -245,6 +335,9 @@ def scrape(args) -> dict:
                     report["errors"].append({"event_id": int(identity), "error": str(error)[:500]})
                 finally:
                     write_json(args.state, state)
+                if report["events_checked"] % 20 == 0:
+                    log_progress("events", report, state, since, until, explicit)
+            log_progress("events", report, state, since, until, explicit)
             decks = sorted(
                 state["decks"].items(),
                 key=lambda pair: (
@@ -256,7 +349,9 @@ def scrape(args) -> dict:
             for identity, record in decks:
                 if explicit and str(record["event_id"]) not in explicit:
                     continue
-                if not explicit and record["event_date"] < since.isoformat():
+                if not explicit and not (
+                    since.isoformat() <= record["event_date"] < until.isoformat()
+                ):
                     continue
                 if not due(record, refresh, args.force):
                     continue
@@ -269,6 +364,12 @@ def scrape(args) -> dict:
                     if html is None:
                         html = http.page(event_url(record["event_id"], int(identity))).text
                     payload = parse_deck(html, record["event_id"], int(identity))
+                    if not explicit and not (
+                        since.isoformat() <= payload["event"]["event_date"] < until.isoformat()
+                    ):
+                        raise ValueError(
+                            "Returned deck event date differs from the requested window"
+                        )
                     report["parsed"] += 1
                     if not args.dry_run:
                         payload, uploaded = resolver.resolve(payload)
@@ -291,6 +392,8 @@ def scrape(args) -> dict:
                     report["errors"].append({"deck_id": int(identity), "error": str(error)[:500]})
                 finally:
                     write_json(args.state, state)
+                if report["deck_attempts"] % 10 == 0:
+                    log_progress("decks", report, state, since, until, explicit)
     except BudgetReached as error:
         report.update(status="partial", stop_reason=str(error))
     except (SourceUnavailable, ValueError) as error:
@@ -303,24 +406,37 @@ def scrape(args) -> dict:
         report["source_requests"] = http.requests
         report["requests_by_host"] = http.by_host
         report["ended_at"] = utc_now()
+        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        imported = sum(report[key] for key in ("inserted", "updated", "unchanged"))
+        report["decks_per_minute"] = round(imported * 60 / max(report["elapsed_seconds"], 0.001), 2)
+        report["coverage"] = coverage(state, since, until, explicit)
+        report["coverage_complete"] = (
+            not report["discovery_truncated"]
+            and not any(
+                counts["pending"] or counts["failed"] for counts in report["coverage"].values()
+            )
+            and report["status"] == "success"
+            and not report["errors"]
+            and not args.dry_run
+        )
+        events_in_scope, decks_in_scope = scoped_records(state, since, until, explicit)
         report["remaining_events"] = sum(
             due(record, refresh, args.force)
-            for identity, record in state["events"].items()
-            if (not explicit or identity in explicit)
-            and (explicit or record["discovered"]["event_date"] >= since.isoformat())
-            and identity not in completed_events
+            for identity, record in events_in_scope.items()
+            if identity not in completed_events
         )
         report["remaining_due"] = sum(
             due(record, refresh, args.force)
-            for identity, record in state["decks"].items()
-            if (not explicit or str(record["event_id"]) in explicit)
-            and (explicit or record["event_date"] >= since.isoformat())
-            and identity not in completed_decks
+            for identity, record in decks_in_scope.items()
+            if identity not in completed_decks
         )
         if report["errors"]:
             report["status"] = "error"
         elif report["status"] == "success" and (
-            report["remaining_events"] or report["remaining_due"] or report["discovery_truncated"]
+            report["remaining_events"]
+            or report["remaining_due"]
+            or report["discovery_truncated"]
+            or any(counts["pending"] for counts in report["coverage"].values())
         ):
             report["status"] = "partial"
         write_json(args.state, state)
