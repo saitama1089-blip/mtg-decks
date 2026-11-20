@@ -139,7 +139,11 @@ def parse_event(html: str, expected_event_id: int) -> EventPage:
         "MTG Online": "mtgo",
         "Online Other": "other_online",
     }.get(platform_image.get("title") if platform_image else None, "unknown")
-    kind = "league" if re.search(r"\bleague\b", title, re.I) else "tournament"
+    # MTGO League labels enumerate published lists. A paper store's "Weekly League"
+    # can have real tournament finishes, so its name alone does not imply that behavior.
+    kind = (
+        "league" if platform == "mtgo" and re.search(r"\bleague\b", title, re.I) else "tournament"
+    )
     event = {
         "source_event_id": expected_event_id,
         "title": title,

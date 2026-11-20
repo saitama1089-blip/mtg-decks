@@ -49,6 +49,12 @@ def test_selected_deck_page_has_its_own_title():
     assert parsed["rank_min"] == 2
 
 
+def test_paper_store_league_keeps_tournament_placements():
+    parsed = parse_deck(sample("single").replace("Marte Duel", "Weekly League"), 94041)
+    assert parsed["event"]["event_kind"] == "tournament"
+    assert parsed["rank_min"] == 1
+
+
 def test_main_listing_excludes_featured_old_events_and_preserves_pagination():
     result = parse_index(sample("index"))
     assert len(result.events) == 20

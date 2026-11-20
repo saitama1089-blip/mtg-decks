@@ -58,6 +58,11 @@ The only required repository Actions secret is `SUPABASE_SECRET_KEY`, from this 
 project. The project URL/reference are fixed in the workflow. The existing migration workflow
 uses a separate database credential and is not needed for scraping.
 
+The [first live Actions run](https://github.com/saitama1089-blip/mtg-decks/actions/runs/44669852550)
+successfully imported four lists, including a partner-commander list, and saved its checkpoint.
+The initial local/Actions pilots populated eight decks and 459 distinct card records across two
+events. A repeat local import returned `unchanged`, and a live commander-usage query succeeded.
+
 ```bash
 # Preview source parsing, with no database writes or Scryfall requests.
 python -m dc_importer scrape --dry-run --max-decks 5
@@ -85,7 +90,7 @@ Scryfall's collection API resolves exact card/face names in batches of at most 7
 and card metadata are cached for 24 hours. Only cards needed by imported decks are seeded.
 
 Source format and selected deck IDs are checked. A main list plus its one/two commanders
-must total 100. League display labels do not become tournament placements. Unresolved or
+must total 100. MTGO League display labels do not become tournament placements. Unresolved or
 ambiguous names, incomplete lists, and changed layouts produce errors and a per-record
 retry delay of 1-24 hours; they never replace an existing valid list. A reviewed alias can
 be added with `add-alias`, then retried with `--force`.
