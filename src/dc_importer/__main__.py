@@ -17,6 +17,21 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("migrate", help="Create/update the dedicated two-table schema")
     sql = sub.add_parser("build-sql", help="Build the re-runnable SQL Editor setup")
     sql.add_argument("--output", type=Path, default=Path("supabase/bootstrap.sql"))
+    scrape = sub.add_parser("scrape", help="Import published MTGTop8 Duel Commander lists")
+    scrape.add_argument("--state", type=Path, default=Path("data/mtgtop8-state.json"))
+    scrape.add_argument("--report", type=Path, default=Path("data/run-report.json"))
+    scrape.add_argument("--lookback-days", type=int, default=14)
+    scrape.add_argument("--since", help="Historical discovery start date, YYYY-MM-DD")
+    scrape.add_argument("--max-pages", type=int, default=5)
+    scrape.add_argument("--max-events", type=int, default=20)
+    scrape.add_argument("--max-decks", type=int, default=50)
+    scrape.add_argument("--max-requests", type=int, default=150)
+    scrape.add_argument("--max-runtime-minutes", type=int, default=15)
+    scrape.add_argument("--refresh-hours", type=int, default=24)
+    scrape.add_argument("--event-id", type=int, action="append")
+    scrape.add_argument("--timezone", default="America/El_Salvador")
+    scrape.add_argument("--force", action="store_true")
+    scrape.add_argument("--dry-run", action="store_true")
     for command in ("load-cards", "load-decks"):
         cmd = sub.add_parser(command)
         cmd.add_argument("file", type=Path)
@@ -52,6 +67,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> dict:
+    if args.command == "scrape":
+        from .scraper import scrape
+
+        return scrape(args)
     if args.command == "build-sql":
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(build_sql(), encoding="utf-8")
@@ -125,7 +144,7 @@ def main() -> int:
         print(f"Database error: {exc.diag.message_primary or exc.sqlstate}", file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2, default=str))
-    return 0
+    return 1 if args.command == "scrape" and result["status"] == "error" else 0
 
 
 if __name__ == "__main__":

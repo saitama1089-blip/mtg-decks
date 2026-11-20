@@ -1,0 +1,97 @@
+name: Import MTGTop8 Duel Commander
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+    # To run daily instead, use: '17 12 * * *' (12:17 UTC).
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: Recent event window in days
+        default: '14'
+        type: string
+      since:
+        description: Optional historical start date (YYYY-MM-DD); repeat to resume backfill
+        type: string
+      max_decks:
+        description: Maximum decks per batch
+        default: '50'
+        type: string
+      event_id:
+        description: Optional single MTGTop8 event ID for a targeted import
+        type: string
+      dry_run:
+        description: Parse source lists without database writes or card API lookups
+        default: false
+        type: boolean
+      force:
+        description: Recheck cached events/decks now, including failed records
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mtgtop8-duel-commander-import
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CACHE_MODE: ${{ inputs.dry_run && 'preview' || 'live' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - run: python -m pip install -r requirements.lock.txt
+      - run: python -m pip install --no-deps -e .
+      - name: Restore scraper checkpoint and card cache
+        uses: actions/cache/restore@v6
+        with:
+          path: data/mtgtop8-state.json
+          key: mtgtop8-djayrdiyastspmoaqkml-v1-${{ env.CACHE_MODE }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            mtgtop8-djayrdiyastspmoaqkml-v1-${{ env.CACHE_MODE }}-
+      - name: Import bounded batch
+        env:
+          SUPABASE_URL: https://djayrdiyastspmoaqkml.supabase.co
+          SUPABASE_PROJECT_REF: djayrdiyastspmoaqkml
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days || '14' }}
+          SINCE: ${{ inputs.since }}
+          MAX_DECKS: ${{ inputs.max_decks || '50' }}
+          EVENT_ID: ${{ inputs.event_id }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          FORCE: ${{ inputs.force }}
+        shell: bash
+        run: |
+          if [[ -z "$SUPABASE_SECRET_KEY" && "$DRY_RUN" != 'true' ]]; then
+            echo '::error::Set the repository Actions secret SUPABASE_SECRET_KEY.'
+            exit 1
+          fi
+          args=(--lookback-days "$LOOKBACK_DAYS" --max-decks "$MAX_DECKS"
+                --max-events 20 --max-pages 5 --max-requests 150 --max-runtime-minutes 15)
+          [[ -z "$SINCE" ]] || args+=(--since "$SINCE")
+          [[ -z "$EVENT_ID" ]] || args+=(--event-id "$EVENT_ID")
+          [[ "$DRY_RUN" != 'true' ]] || args+=(--dry-run)
+          [[ "$FORCE" != 'true' ]] || args+=(--force)
+          python -m dc_importer scrape "${args[@]}"
+      - name: Save checkpoint even after a partial or failed batch
+        if: always() && hashFiles('data/mtgtop8-state.json') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: data/mtgtop8-state.json
+          key: mtgtop8-djayrdiyastspmoaqkml-v1-${{ env.CACHE_MODE }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Publish run report
+        if: always() && hashFiles('data/run-report.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: mtgtop8-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: data/run-report.json
+          retention-days: 14
